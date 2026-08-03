@@ -100,11 +100,28 @@ sudo block-ip.sh remove 203.0.113.7
 sudo block-ip.sh list
 sudo block-ip.sh status 203.0.113.7
 sudo block-ip.sh sync   # reapply every recorded IP to the live firewall
+sudo block-ip.sh config # show current settings + firewall backend + block count
+sudo block-ip.sh rules  # show the ACTUAL live firewall rules blocking IPs
 ```
 
 `block-ip.sh` works standalone too — if `/etc/ssh-guard/config.conf` doesn't
 exist or has no `WEBHOOK_URL`, it just skips the Discord notification and
 blocks/unblocks silently.
+
+`sudo block-ip.sh config` shows the current settings, active firewall
+backend, and how many IPs are currently recorded as blocked — the webhook URL
+is partially masked in the output, since it's a secret.
+
+`sudo block-ip.sh rules` shows the actual, live rules from the firewall
+itself (not this script's record file) — the real source of truth for what's
+currently being dropped. Useful for confirming a block really took effect, or
+spotting drift between what `list` reports and what the firewall is actually
+doing:
+
+- **ufw** → `ufw status numbered`
+- **firewalld** → the active zone's rich rules
+- **nftables** → the `blocked_ips` set and its containing table
+- **iptables** → the `DROP` rules in the `INPUT` chain
 
 `block-ip.sh status <ip>` also prints the all-time failed-login count for that
 IP if one exists in `/var/lib/ssh-guard/lifetime_fail_counts.tsv`, even if the
