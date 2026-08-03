@@ -58,6 +58,7 @@ prompt() {
 EXISTING_CONFIG="/etc/ssh-guard/config.conf"
 _EXISTING_WEBHOOK_URL="" _EXISTING_SSHD_UNIT="" _EXISTING_DO_GEOIP=""
 _EXISTING_AUTO_BLOCK="" _EXISTING_FAIL_THRESHOLD="" _EXISTING_FAIL_WINDOW=""
+_EXISTING_NOTIFY_FAILED_ATTEMPTS=""
 if [[ -f "$EXISTING_CONFIG" ]]; then
   echo "==> Existing config found at $EXISTING_CONFIG — its values will be offered as defaults."
   # shellcheck disable=SC1090
@@ -91,6 +92,7 @@ prompt DO_GEOIP        "Include GeoIP lookups in notifications? (true/false)" "$
 prompt AUTO_BLOCK      "Auto-block IPs after repeated failed logins? (true/false)" "${_EXISTING_AUTO_BLOCK:-true}"
 prompt FAIL_THRESHOLD  "Failed attempts before auto-block" "${_EXISTING_FAIL_THRESHOLD:-5}"
 prompt FAIL_WINDOW     "Time window for the above, in seconds" "${_EXISTING_FAIL_WINDOW:-600}"
+prompt NOTIFY_FAILED_ATTEMPTS "Send a Discord message for EVERY failed/preauth attempt? (false = stay quiet until an IP is actually blocked)" "${_EXISTING_NOTIFY_FAILED_ATTEMPTS:-true}"
 
 # ---------- write shared config ----------
 echo "==> Writing /etc/ssh-guard/config.conf"
@@ -103,6 +105,7 @@ DO_GEOIP="${DO_GEOIP}"
 AUTO_BLOCK="${AUTO_BLOCK}"
 FAIL_THRESHOLD=${FAIL_THRESHOLD}
 FAIL_WINDOW=${FAIL_WINDOW}
+NOTIFY_FAILED_ATTEMPTS="${NOTIFY_FAILED_ATTEMPTS}"
 EOF
 chmod 600 /etc/ssh-guard/config.conf
 chown root:root /etc/ssh-guard/config.conf
@@ -132,6 +135,7 @@ fi
 : "${AUTO_BLOCK:=true}"
 : "${FAIL_THRESHOLD:=5}"
 : "${FAIL_WINDOW:=600}"
+: "${NOTIFY_FAILED_ATTEMPTS:=true}"
 
 HOST_LABEL="$(hostname)"
 mkdir -p "$STATE_DIR"
@@ -233,13 +237,28 @@ journalctl -fu "$SSHD_UNIT" -o cat --since "now" | while IFS= read -r line; do
     ip="${BASH_REMATCH[3]}"
     count="$(record_failure_and_count "$ip")"
     lifetime="$(increment_lifetime_count "$ip")"
-    send_discord "❌ SSH Login Failed" 15158332 "$user" "$ip" "Attempt ${count}/${FAIL_THRESHOLD} in ${FAIL_WINDOW}s window • Lifetime failed attempts from this IP: ${lifetime}"
+    if [[ "$NOTIFY_FAILED_ATTEMPTS" == "true" ]]; then
+      send_discord "❌ SSH Login Failed" 15158332 "$user" "$ip" "Attempt ${count}/${FAIL_THRESHOLD} in ${FAIL_WINDOW}s window • Lifetime failed attempts from this IP: ${lifetime}"
+    fi
     maybe_auto_block "$ip" "$count"
 
-  elif [[ "$line" =~ Connection\ closed\ by\ authenticating\ user\ ([^[:space:]]+)\ ([^[:space:]]+)\ port.*\[preauth\] ]]; then
-    user="${BASH_REMATCH[1]}"
+  elif [[ "$line" =~ Invalid\ user\ ([^[:space:]]*)\ from\ ([^[:space:]]+)\ port ]]; then
+    raw_user="${BASH_REMATCH[1]}"
+    user="${raw_user:-<blank>}"
     ip="${BASH_REMATCH[2]}"
-    send_discord "⚠️ SSH Connection Closed (preauth)" 15105570 "$user" "$ip"
+    count="$(record_failure_and_count "$ip")"
+    lifetime="$(increment_lifetime_count "$ip")"
+    if [[ "$NOTIFY_FAILED_ATTEMPTS" == "true" ]]; then
+      send_discord "❌ SSH Login Failed" 15158332 "$user" "$ip" "Invalid username, rejected before password prompt • Attempt ${count}/${FAIL_THRESHOLD} in ${FAIL_WINDOW}s window • Lifetime failed attempts from this IP: ${lifetime}"
+    fi
+    maybe_auto_block "$ip" "$count"
+
+  elif [[ "$line" =~ (Connection\ closed\ by|Disconnected\ from)\ authenticating\ user\ ([^[:space:]]+)\ ([^[:space:]]+)\ port.*\[preauth\] ]]; then
+    user="${BASH_REMATCH[2]}"
+    ip="${BASH_REMATCH[3]}"
+    if [[ "$NOTIFY_FAILED_ATTEMPTS" == "true" ]]; then
+      send_discord "⚠️ SSH Connection Closed (preauth)" 15105570 "$user" "$ip"
+    fi
   fi
 done
 NOTIFY_SCRIPT_EOF
@@ -516,6 +535,7 @@ cmd_config() {
     printf "%-15s %s\n" "AUTO_BLOCK"     "${AUTO_BLOCK:-(unset)}"
     printf "%-15s %s\n" "FAIL_THRESHOLD" "${FAIL_THRESHOLD:-(unset)}"
     printf "%-15s %s\n" "FAIL_WINDOW"    "${FAIL_WINDOW:-(unset)}s"
+    printf "%-15s %s\n" "NOTIFY_FAILED_ATTEMPTS" "${NOTIFY_FAILED_ATTEMPTS:-(unset)}"
   fi
 
   echo
