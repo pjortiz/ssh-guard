@@ -30,7 +30,7 @@ automatically block that IP using whatever firewall you already have running
 Host `install.sh` in your repo, then on the VPS run it as root:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<you>/<repo>/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/pjortiz/ssh-guard/refs/heads/main/install-ssh-guard.sh | sudo bash
 ```
 
 You'll be prompted for:
@@ -45,7 +45,7 @@ You'll be prompted for:
 Useful for provisioning scripts, Ansible, cloud-init, etc.:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<you>/<repo>/main/install.sh | sudo \
+curl -fsSL https://raw.githubusercontent.com/pjortiz/ssh-guard/refs/heads/main/install-ssh-guard.sh | sudo \
   WEBHOOK_URL="https://discord.com/api/webhooks/xxx/yyy" \
   DO_GEOIP=true \
   AUTO_BLOCK=true \
