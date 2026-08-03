@@ -54,6 +54,16 @@ prompt() {
   printf -v "$__var" '%s' "${__answer:-$__default}"
 }
 
+# ---------- load existing config (if any) as defaults for a clean rerun ----------
+EXISTING_CONFIG="/etc/ssh-guard/config.conf"
+_EXISTING_WEBHOOK_URL="" _EXISTING_SSHD_UNIT="" _EXISTING_DO_GEOIP=""
+_EXISTING_AUTO_BLOCK="" _EXISTING_FAIL_THRESHOLD="" _EXISTING_FAIL_WINDOW=""
+if [[ -f "$EXISTING_CONFIG" ]]; then
+  echo "==> Existing config found at $EXISTING_CONFIG — its values will be offered as defaults."
+  # shellcheck disable=SC1090
+  source <(grep -E '^[A-Z_]+=' "$EXISTING_CONFIG" | sed 's/^/_EXISTING_/')
+fi
+
 # ---------- detect sshd systemd unit name ----------
 SSHD_UNIT_DETECTED=""
 for candidate in ssh sshd; do
@@ -62,25 +72,25 @@ for candidate in ssh sshd; do
     break
   fi
 done
-SSHD_UNIT="${SSHD_UNIT:-$SSHD_UNIT_DETECTED}"
+SSHD_UNIT="${SSHD_UNIT:-${_EXISTING_SSHD_UNIT:-$SSHD_UNIT_DETECTED}}"
 if [[ -z "$SSHD_UNIT" ]]; then
   prompt SSHD_UNIT "Could not auto-detect sshd unit. Enter it (e.g. sshd)" "ssh"
 fi
 echo "==> Using SSH service unit: ${SSHD_UNIT}"
 
-# ---------- collect settings ----------
+# ---------- collect settings (existing config values are offered as defaults) ----------
 if [[ -z "${WEBHOOK_URL:-}" ]]; then
-  prompt WEBHOOK_URL "Enter your Discord webhook URL" ""
+  prompt WEBHOOK_URL "Enter your Discord webhook URL" "${_EXISTING_WEBHOOK_URL:-}"
 fi
 if [[ -z "$WEBHOOK_URL" || "$WEBHOOK_URL" != https://discord.com/api/webhooks/* ]]; then
   echo "That doesn't look like a valid Discord webhook URL (expected https://discord.com/api/webhooks/...)." >&2
   exit 1
 fi
 
-prompt DO_GEOIP        "Include GeoIP lookups in notifications? (true/false)" "true"
-prompt AUTO_BLOCK      "Auto-block IPs after repeated failed logins? (true/false)" "true"
-prompt FAIL_THRESHOLD  "Failed attempts before auto-block" "5"
-prompt FAIL_WINDOW     "Time window for the above, in seconds" "600"
+prompt DO_GEOIP        "Include GeoIP lookups in notifications? (true/false)" "${_EXISTING_DO_GEOIP:-true}"
+prompt AUTO_BLOCK      "Auto-block IPs after repeated failed logins? (true/false)" "${_EXISTING_AUTO_BLOCK:-true}"
+prompt FAIL_THRESHOLD  "Failed attempts before auto-block" "${_EXISTING_FAIL_THRESHOLD:-5}"
+prompt FAIL_WINDOW     "Time window for the above, in seconds" "${_EXISTING_FAIL_WINDOW:-600}"
 
 # ---------- write shared config ----------
 echo "==> Writing /etc/ssh-guard/config.conf"
@@ -106,6 +116,7 @@ set -euo pipefail
 CONFIG_FILE="/etc/ssh-guard/config.conf"
 STATE_DIR="/var/lib/ssh-guard"
 FAIL_LOG="${STATE_DIR}/fail_attempts.log"
+LIFETIME_FILE="${STATE_DIR}/lifetime_fail_counts.tsv"
 BLOCK_SCRIPT="/usr/local/bin/block-ip.sh"
 
 if [[ -f "$CONFIG_FILE" ]]; then
@@ -124,7 +135,7 @@ fi
 
 HOST_LABEL="$(hostname)"
 mkdir -p "$STATE_DIR"
-touch "$FAIL_LOG"
+touch "$FAIL_LOG" "$LIFETIME_FILE"
 
 geoip_lookup() {
   local ip="$1"
@@ -182,6 +193,19 @@ record_failure_and_count() {
   grep -c "^${ip}|" "$FAIL_LOG" || true
 }
 
+increment_lifetime_count() {
+  local ip="$1"
+  local tmp
+  tmp="$(mktemp)"
+  awk -F'\t' -v ip="$ip" -v OFS='\t' '
+    $1 == ip { $2 = $2 + 1; found=1 }
+    { print }
+    END { if (!found) print ip, 1 }
+  ' "$LIFETIME_FILE" > "$tmp"
+  mv "$tmp" "$LIFETIME_FILE"
+  awk -F'\t' -v ip="$ip" '$1 == ip { print $2 }' "$LIFETIME_FILE"
+}
+
 maybe_auto_block() {
   local ip="$1" count="$2"
 
@@ -208,7 +232,8 @@ journalctl -fu "$SSHD_UNIT" -o cat --since "now" | while IFS= read -r line; do
     user="${BASH_REMATCH[2]}"
     ip="${BASH_REMATCH[3]}"
     count="$(record_failure_and_count "$ip")"
-    send_discord "❌ SSH Login Failed" 15158332 "$user" "$ip" "Attempt ${count}/${FAIL_THRESHOLD} in ${FAIL_WINDOW}s window"
+    lifetime="$(increment_lifetime_count "$ip")"
+    send_discord "❌ SSH Login Failed" 15158332 "$user" "$ip" "Attempt ${count}/${FAIL_THRESHOLD} in ${FAIL_WINDOW}s window • Lifetime failed attempts from this IP: ${lifetime}"
     maybe_auto_block "$ip" "$count"
 
   elif [[ "$line" =~ Connection\ closed\ by\ authenticating\ user\ ([^[:space:]]+)\ ([^[:space:]]+)\ port.*\[preauth\] ]]; then
@@ -229,6 +254,7 @@ set -euo pipefail
 
 CONFIG_FILE="/etc/ssh-guard/config.conf"
 RECORD_FILE="/etc/ssh-guard/blocked_ips.list"
+LIFETIME_FILE="/var/lib/ssh-guard/lifetime_fail_counts.tsv"
 NFT_TABLE="inet"
 NFT_TABLE_NAME="filter"
 NFT_SET_NAME="blocked_ips"
@@ -255,6 +281,7 @@ Usage:
   $(basename "$0") remove <ip>
   $(basename "$0") list
   $(basename "$0") status <ip>
+  $(basename "$0") sync
 USAGE
   exit 1
 }
@@ -430,6 +457,21 @@ cmd_list() {
   done < "$RECORD_FILE"
 }
 
+cmd_sync() {
+  if [[ ! -s "$RECORD_FILE" ]]; then
+    echo "No recorded IPs to sync."
+    return
+  fi
+
+  local count=0
+  while IFS='|' read -r ip _ts _reason; do
+    [[ -z "$ip" ]] && continue
+    backend_add "$ip" || echo "Warning: failed to (re)apply rule for $ip" >&2
+    count=$(( count + 1 ))
+  done < "$RECORD_FILE"
+  echo "Synced $count recorded IP(s) to the $BACKEND firewall."
+}
+
 cmd_status() {
   local ip="$1"
   if grep -q "^${ip}|" "$RECORD_FILE" 2>/dev/null; then
@@ -437,6 +479,14 @@ cmd_status() {
     grep "^${ip}|" "$RECORD_FILE"
   else
     echo "$ip is not blocked (per record file)."
+  fi
+
+  if [[ -f "$LIFETIME_FILE" ]]; then
+    local lifetime
+    lifetime="$(awk -F'\t' -v ip="$ip" '$1 == ip { print $2 }' "$LIFETIME_FILE")"
+    if [[ -n "$lifetime" ]]; then
+      echo "Lifetime failed SSH attempts from this IP: $lifetime"
+    fi
   fi
 }
 
@@ -459,6 +509,9 @@ case "$1" in
     [[ $# -ne 2 ]] && usage
     cmd_status "$2"
     ;;
+  sync)
+    cmd_sync
+    ;;
   *)
     usage
     ;;
@@ -477,6 +530,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+ExecStartPre=-/usr/local/bin/block-ip.sh sync
 ExecStart=/usr/local/bin/ssh-discord-notify.sh
 Restart=always
 RestartSec=5
@@ -498,6 +552,9 @@ else
   echo "==> Service failed to start. Check: journalctl -u ssh-discord-notify -n 50" >&2
   exit 1
 fi
+# Note: block-ip.sh sync already ran automatically as part of the service
+# starting (see ExecStartPre in the unit file), reconciling any previously
+# recorded blocks with the live firewall.
 
 echo "==> Sending a test message to Discord..."
 curl -s -H "Content-Type: application/json" -X POST "$WEBHOOK_URL" -d '{
