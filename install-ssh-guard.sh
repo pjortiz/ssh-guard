@@ -3,7 +3,7 @@
 # install.sh — SSH Discord Notifier + Auto-Block installer
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/<you>/<repo>/main/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/pjortiz/ssh-guard/refs/heads/main/install-ssh-guard.sh | sudo bash
 #
 #   Non-interactive:
 #   curl -fsSL .../install.sh | sudo \
@@ -210,6 +210,24 @@ increment_lifetime_count() {
   awk -F'\t' -v ip="$ip" '$1 == ip { print $2 }' "$LIFETIME_FILE"
 }
 
+get_lifetime_count() {
+  local ip="$1"
+  local n
+  n="$(awk -F'\t' -v ip="$ip" '$1 == ip { print $2 }' "$LIFETIME_FILE" 2>/dev/null)"
+  echo "${n:-0}"
+}
+
+should_notify_failure() {
+  local lifetime="$1"
+  if [[ "$NOTIFY_FAILED_ATTEMPTS" == "true" ]]; then
+    return 0
+  fi
+  if (( lifetime > FAIL_THRESHOLD )); then
+    return 0
+  fi
+  return 1
+}
+
 maybe_auto_block() {
   local ip="$1" count="$2"
 
@@ -237,7 +255,7 @@ journalctl -fu "$SSHD_UNIT" -o cat --since "now" | while IFS= read -r line; do
     ip="${BASH_REMATCH[3]}"
     count="$(record_failure_and_count "$ip")"
     lifetime="$(increment_lifetime_count "$ip")"
-    if [[ "$NOTIFY_FAILED_ATTEMPTS" == "true" ]]; then
+    if should_notify_failure "$lifetime"; then
       send_discord "❌ SSH Login Failed" 15158332 "$user" "$ip" "Attempt ${count}/${FAIL_THRESHOLD} in ${FAIL_WINDOW}s window • Lifetime failed attempts from this IP: ${lifetime}"
     fi
     maybe_auto_block "$ip" "$count"
@@ -248,7 +266,7 @@ journalctl -fu "$SSHD_UNIT" -o cat --since "now" | while IFS= read -r line; do
     ip="${BASH_REMATCH[2]}"
     count="$(record_failure_and_count "$ip")"
     lifetime="$(increment_lifetime_count "$ip")"
-    if [[ "$NOTIFY_FAILED_ATTEMPTS" == "true" ]]; then
+    if should_notify_failure "$lifetime"; then
       send_discord "❌ SSH Login Failed" 15158332 "$user" "$ip" "Invalid username, rejected before password prompt • Attempt ${count}/${FAIL_THRESHOLD} in ${FAIL_WINDOW}s window • Lifetime failed attempts from this IP: ${lifetime}"
     fi
     maybe_auto_block "$ip" "$count"
@@ -256,7 +274,8 @@ journalctl -fu "$SSHD_UNIT" -o cat --since "now" | while IFS= read -r line; do
   elif [[ "$line" =~ (Connection\ closed\ by|Disconnected\ from)\ authenticating\ user\ ([^[:space:]]+)\ ([^[:space:]]+)\ port.*\[preauth\] ]]; then
     user="${BASH_REMATCH[2]}"
     ip="${BASH_REMATCH[3]}"
-    if [[ "$NOTIFY_FAILED_ATTEMPTS" == "true" ]]; then
+    lifetime="$(get_lifetime_count "$ip")"
+    if should_notify_failure "$lifetime"; then
       send_discord "⚠️ SSH Connection Closed (preauth)" 15105570 "$user" "$ip"
     fi
   fi
