@@ -27,7 +27,7 @@ automatically block that IP using whatever firewall you already have running
 
 ## Install
 
-Host `install.sh` in your repo, then on the VPS run it as root:
+Host `install-ssh-guard.sh` in your repo, then on the VPS run it as root:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/pjortiz/ssh-guard/refs/heads/main/install-ssh-guard.sh | sudo bash
@@ -66,11 +66,11 @@ The installer also:
 
 ## What you'll see in Discord
 
-- ✅ **SSH Login Succeeded** — host, user, source IP, location
-- ❌ **SSH Login Failed** — host, user, source IP, location, the current attempt count within the failure window, and the all-time (lifetime) failed-attempt count for that IP
-- ⚠️ **SSH Connection Closed (preauth)** — connection dropped before completing authentication
-- 🚫 **IP Blocked** — fired by `block-ip.sh`, whether triggered manually or automatically
-- ✅ **IP Unblocked** — fired by `block-ip.sh remove`
+- ✅ **SSH Login Succeeded** — host, user, source IP, location. Always sent regardless of `NOTIFY_FAILED_ATTEMPTS`.
+- ❌ **SSH Login Failed** — host, user, source IP, location, the current attempt count within the failure window, and the all-time (lifetime) failed-attempt count for that IP. Suppressed if `NOTIFY_FAILED_ATTEMPTS=false`, **unless** that IP's lifetime failure count already exceeds `FAIL_THRESHOLD` — repeat offenders always get surfaced.
+- ⚠️ **SSH Connection Closed (preauth)** — connection dropped before completing authentication. Same suppression rule and repeat-offender exception as above.
+- 🚫 **IP Blocked** — fired by `block-ip.sh`, whether triggered manually or automatically. Always sent, even with `NOTIFY_FAILED_ATTEMPTS=false` — this is usually the one message you actually want.
+- ✅ **IP Unblocked** — fired by `block-ip.sh remove`. Always sent.
 
 ## Configuration
 
@@ -89,8 +89,19 @@ sudo systemctl restart ssh-discord-notify
 | `AUTO_BLOCK` | `true` | Automatically block an IP after too many failures |
 | `FAIL_THRESHOLD` | `5` | Failed attempts (per IP) before auto-block fires |
 | `FAIL_WINDOW` | `600` | Time window in seconds for the above |
+| `NOTIFY_FAILED_ATTEMPTS` | `true` | Send a Discord message for every individual failed/preauth attempt. Set to `false` to stay quiet on each attempt while still counting them, tracking the lifetime counter, and auto-blocking — you'll just get the single "IP Blocked" message once a block actually happens. **Exception:** once an IP's lifetime failed-attempt count exceeds `FAIL_THRESHOLD`, per-attempt notifications for that IP always fire regardless of this setting — see below. |
 
 This file contains your webhook URL, so it's created with `chmod 600` (root-only read). Keep it that way.
+
+### Repeat-offender escalation
+
+`NOTIFY_FAILED_ATTEMPTS=false` is meant to quiet down routine scanner noise,
+not hide a genuinely persistent attacker. So there's one built-in override:
+once a given IP's **lifetime** failed-attempt count exceeds `FAIL_THRESHOLD`,
+every subsequent failed/preauth notification from that IP fires regardless of
+`NOTIFY_FAILED_ATTEMPTS`. This matters most if you run with `AUTO_BLOCK=false`
+(so the IP is never actually blocked) — without this override, a determined
+attacker could keep retrying indefinitely in total silence.
 
 ## Managing blocked IPs
 
@@ -150,7 +161,7 @@ sudo systemctl status ssh-discord-notify
 
 ## Rerunning the installer
 
-Rerunning `install.sh` is safe and won't disrupt existing state:
+Rerunning `install-ssh-guard.sh` is safe and won't disrupt existing state:
 
 - `/usr/local/bin/ssh-discord-notify.sh` and `block-ip.sh` are overwritten cleanly (no duplication).
 - `/etc/ssh-guard/blocked_ips.list`, `/var/lib/ssh-guard/fail_attempts.log`, and `/var/lib/ssh-guard/lifetime_fail_counts.tsv` are never touched — block history and lifetime counts survive.
