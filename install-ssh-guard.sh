@@ -282,6 +282,8 @@ Usage:
   $(basename "$0") list
   $(basename "$0") status <ip>
   $(basename "$0") sync
+  $(basename "$0") config
+  $(basename "$0") rules
 USAGE
   exit 1
 }
@@ -457,6 +459,74 @@ cmd_list() {
   done < "$RECORD_FILE"
 }
 
+mask_webhook() {
+  local url="$1"
+  if [[ -z "$url" ]]; then
+    echo "(not set)"
+    return
+  fi
+  local prefix token
+  prefix="${url%/*}"
+  token="${url##*/}"
+  if [[ ${#token} -gt 4 ]]; then
+    echo "${prefix}/${token:0:4}**********(hidden)"
+  else
+    echo "${prefix}/**********(hidden)"
+  fi
+}
+
+cmd_rules() {
+  echo "Firewall backend: $BACKEND"
+  echo "--------------------------------------------------------"
+  case "$BACKEND" in
+    ufw)
+      ufw status numbered
+      ;;
+    firewalld)
+      echo "Default zone: $(firewall-cmd --get-default-zone 2>/dev/null || echo unknown)"
+      echo
+      echo "Rich rules (includes our blocks and any others):"
+      firewall-cmd --list-rich-rules 2>/dev/null || echo "(none, or firewalld not running)"
+      ;;
+    nftables)
+      if nft list table "${NFT_TABLE} ${NFT_TABLE_NAME}" >/dev/null 2>&1; then
+        nft list table "${NFT_TABLE} ${NFT_TABLE_NAME}"
+      else
+        echo "(table '${NFT_TABLE} ${NFT_TABLE_NAME}' not created yet — no IPs blocked so far)"
+      fi
+      ;;
+    iptables)
+      local out
+      out="$(iptables -L "$IPTABLES_CHAIN" -n -v --line-numbers 2>/dev/null)"
+      echo "$out" | head -2
+      echo "$out" | grep -E '\bDROP\b' || echo "(no DROP rules currently in $IPTABLES_CHAIN)"
+      ;;
+  esac
+}
+
+cmd_config() {
+  echo "Config file: $CONFIG_FILE"
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "(not found — block-ip.sh is running standalone, without Discord notifications)"
+  else
+    echo "--------------------------------------------------------"
+    printf "%-15s %s\n" "WEBHOOK_URL"    "$(mask_webhook "${WEBHOOK_URL:-}")"
+    printf "%-15s %s\n" "SSHD_UNIT"      "${SSHD_UNIT:-(unset)}"
+    printf "%-15s %s\n" "DO_GEOIP"       "${DO_GEOIP:-(unset)}"
+    printf "%-15s %s\n" "AUTO_BLOCK"     "${AUTO_BLOCK:-(unset)}"
+    printf "%-15s %s\n" "FAIL_THRESHOLD" "${FAIL_THRESHOLD:-(unset)}"
+    printf "%-15s %s\n" "FAIL_WINDOW"    "${FAIL_WINDOW:-(unset)}s"
+  fi
+
+  echo
+  echo "Firewall backend: $BACKEND"
+  echo "Record file:      $RECORD_FILE"
+  local n_blocked
+  n_blocked="$(wc -l < "$RECORD_FILE" 2>/dev/null || echo 0)"
+  n_blocked="$(echo "$n_blocked" | tr -d '[:space:]')"
+  echo "IPs currently blocked (recorded): $n_blocked"
+}
+
 cmd_sync() {
   if [[ ! -s "$RECORD_FILE" ]]; then
     echo "No recorded IPs to sync."
@@ -511,6 +581,12 @@ case "$1" in
     ;;
   sync)
     cmd_sync
+    ;;
+  config)
+    cmd_config
+    ;;
+  rules)
+    cmd_rules
     ;;
   *)
     usage
