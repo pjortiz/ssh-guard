@@ -103,10 +103,10 @@ prompt DO_GEOIP        "Include GeoIP lookups in notifications? (true/false)" "$
 prompt AUTO_BLOCK      "Auto-block IPs after repeated failed logins? (true/false)" "${_EXISTING_AUTO_BLOCK:-true}"
 prompt FAIL_THRESHOLD  "Failed attempts before auto-block" "${_EXISTING_FAIL_THRESHOLD:-5}"
 prompt FAIL_WINDOW     "Time window for the above, in seconds" "${_EXISTING_FAIL_WINDOW:-600}"
-prompt NOTIFY_FAILED_ATTEMPTS "Send a Discord message for EVERY failed/preauth attempt? (false = stay quiet until an IP is actually blocked; repeat offenders past the threshold above always notify regardless)" "${_EXISTING_NOTIFY_FAILED_ATTEMPTS:-true}"
+prompt NOTIFY_FAILED_ATTEMPTS "Send a Discord message for EVERY failed/preauth attempt? (false = stay quiet until an IP is actually blocked; repeat offenders past the threshold above always notify regardless, unless the IP is already blocked)" "${_EXISTING_NOTIFY_FAILED_ATTEMPTS:-true}"
 prompt NOTIFY_ON_BLOCK "Send a Discord message when an IP gets blocked? (false = block silently)" "${_EXISTING_NOTIFY_ON_BLOCK:-true}"
 prompt MENTION_DEFAULT "Default @mention for ALL notification types — none / everyone / role:<id> / user:<id> (you can fine-tune each type individually afterward by editing config.conf; this will overwrite any such per-type customization)" "${_EXISTING_MENTION_ON_FAILURE:-none}"
-prompt REPORT_ENABLED  "Enable periodic summary reports (failed/invalid/blocked counts + blocked IP list) via cron? (true/false)" "${_EXISTING_REPORT_ENABLED:-false}"
+prompt REPORT_ENABLED  "Enable periodic summary reports (failed/invalid/blocked counts) via cron? (true/false)" "${_EXISTING_REPORT_ENABLED:-false}"
 prompt REPORT_CRON     "Cron schedule for the report (standard 5-field cron syntax)" "${_EXISTING_REPORT_CRON:-0 8 * * *}"
 
 
@@ -158,6 +158,7 @@ CONFIG_FILE="/etc/ssh-guard/config.conf"
 STATE_DIR="/var/lib/ssh-guard"
 FAIL_LOG="${STATE_DIR}/fail_attempts.log"
 LIFETIME_FILE="${STATE_DIR}/lifetime_fail_counts.tsv"
+RECORD_FILE="/etc/ssh-guard/blocked_ips.list"
 BLOCK_SCRIPT="/usr/local/bin/block-ip.sh"
 
 COUNTER_FAILED_PW="${STATE_DIR}/counter_failed_password.count"
@@ -318,15 +319,29 @@ get_lifetime_count() {
   echo "${n:-0}"
 }
 
+# Checks whether an IP is already recorded as blocked.
+is_ip_blocked() {
+  local ip="$1"
+  [[ -f "$RECORD_FILE" ]] && grep -q "^${ip}|" "$RECORD_FILE" 2>/dev/null
+}
+
 # Decides whether a failed-attempt notification should be sent: yes if
-# NOTIFY_FAILED_ATTEMPTS is true, OR if this IP is a repeat offender
-# whose lifetime failure count already exceeds FAIL_THRESHOLD — so
-# persistent attackers still get surfaced even when per-attempt
-# notifications are otherwise muted.
+# NOTIFY_FAILED_ATTEMPTS is true, OR if this IP is a repeat offender whose
+# lifetime failure count already exceeds FAIL_THRESHOLD — so persistent
+# attackers still get surfaced even when per-attempt notifications are
+# otherwise muted. That escalation is skipped entirely, though, once the
+# IP is already blocked: a burst of near-simultaneous attempts can land
+# after the block fires (in-flight connections, or an IP reconnecting
+# faster than the firewall rule takes effect) and would otherwise bypass
+# NOTIFY_FAILED_ATTEMPTS=false on every single one of them, even though
+# the "IP Blocked" notification already covered it.
 should_notify_failure() {
-  local lifetime="$1"
+  local lifetime="$1" ip="$2"
   if [[ "$NOTIFY_FAILED_ATTEMPTS" == "true" ]]; then
     return 0
+  fi
+  if is_ip_blocked "$ip"; then
+    return 1
   fi
   if (( lifetime > FAIL_THRESHOLD )); then
     return 0
@@ -367,7 +382,7 @@ journalctl -fu "$SSHD_UNIT" -o cat --since "now" | while IFS= read -r line; do
     count="$(record_failure_and_count "$ip")"
     lifetime="$(increment_lifetime_count "$ip")"
     increment_counter "$COUNTER_FAILED_PW"
-    if should_notify_failure "$lifetime"; then
+    if should_notify_failure "$lifetime" "$ip"; then
       send_discord "❌ SSH Login Failed" 15158332 "$user" "$ip" "Attempt ${count}/${FAIL_THRESHOLD} in ${FAIL_WINDOW}s window • Lifetime failed attempts from this IP: ${lifetime}" "$MENTION_ON_FAILURE"
     fi
     maybe_auto_block "$ip" "$count"
@@ -379,7 +394,7 @@ journalctl -fu "$SSHD_UNIT" -o cat --since "now" | while IFS= read -r line; do
     count="$(record_failure_and_count "$ip")"
     lifetime="$(increment_lifetime_count "$ip")"
     increment_counter "$COUNTER_INVALID_USER"
-    if should_notify_failure "$lifetime"; then
+    if should_notify_failure "$lifetime" "$ip"; then
       send_discord "❌ SSH Login Failed" 15158332 "$user" "$ip" "Invalid username, rejected before password prompt • Attempt ${count}/${FAIL_THRESHOLD} in ${FAIL_WINDOW}s window • Lifetime failed attempts from this IP: ${lifetime}" "$MENTION_ON_FAILURE"
     fi
     maybe_auto_block "$ip" "$count"
@@ -389,7 +404,7 @@ journalctl -fu "$SSHD_UNIT" -o cat --since "now" | while IFS= read -r line; do
     ip="${BASH_REMATCH[3]}"
     lifetime="$(get_lifetime_count "$ip")"
     increment_counter "$COUNTER_PREAUTH"
-    if should_notify_failure "$lifetime"; then
+    if should_notify_failure "$lifetime" "$ip"; then
       send_discord "⚠️ SSH Connection Closed (preauth)" 15105570 "$user" "$ip" "" "$MENTION_ON_FAILURE"
     fi
 
@@ -962,28 +977,13 @@ if [[ -n "$base_time" ]]; then
   period_desc="since ${base_time}"
 fi
 
-# Build the currently-blocked-IPs list (point-in-time snapshot, not a delta)
-blocked_list=""
+# Currently-blocked IP count (point-in-time, not a delta) — the full list
+# used to be included here too, but that's dropped now: it duplicates what
+# `block-ip.sh list` already shows on demand, and grows unwieldy fast.
 total_blocked=0
 if [[ -s "$RECORD_FILE" ]]; then
   total_blocked="$(wc -l < "$RECORD_FILE" | tr -d '[:space:]')"
-  while IFS='|' read -r ip ts reason; do
-    [[ -z "$ip" ]] && continue
-    entry="• ${ip} — ${reason}"
-    if (( ${#blocked_list} + ${#entry} > 900 )); then
-      blocked_list="${blocked_list}
-…and more (see: sudo block-ip.sh list)"
-      break
-    fi
-    if [[ -n "$blocked_list" ]]; then
-      blocked_list="${blocked_list}
-${entry}"
-    else
-      blocked_list="$entry"
-    fi
-  done < "$RECORD_FILE"
 fi
-[[ -z "$blocked_list" ]] && blocked_list="(none)"
 
 compute_mention "$MENTION_ON_REPORT"
 
@@ -1004,8 +1004,7 @@ curl -s -H "Content-Type: application/json" -X POST "$WEBHOOK_URL" -d @- >/dev/n
       {"name": "Preauth disconnects", "value": "${delta_preauth}", "inline": true},
       {"name": "Unauthenticated probes", "value": "${delta_probe}", "inline": true},
       {"name": "New IPs blocked", "value": "${delta_blocks}", "inline": true},
-      {"name": "Total IPs currently blocked", "value": "${total_blocked}", "inline": true},
-      {"name": "Currently blocked IPs", "value": "$(json_escape "$blocked_list")", "inline": false}
+      {"name": "Total IPs currently blocked", "value": "${total_blocked}", "inline": true}
     ],
     "timestamp": "${now_ts}"
   }]
