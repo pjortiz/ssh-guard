@@ -138,8 +138,7 @@ Set `REPORT_ENABLED=true` (via the installer prompt or directly in
 `config.conf`) to get a recurring Discord summary on the schedule in
 `REPORT_CRON` (standard 5-field cron syntax, default `0 8 * * *` — daily at
 8am server time). Each report shows counts **since the previous report**
-(not an ever-growing all-time total), plus a point-in-time snapshot of
-every currently-blocked IP and why:
+(not an ever-growing all-time total):
 
 - Failed password attempts
 - Invalid user attempts
@@ -147,7 +146,10 @@ every currently-blocked IP and why:
 - Unauthenticated probes
 - New IPs blocked
 - Total IPs currently blocked
-- The list of currently blocked IPs, each with its block reason (truncated with a pointer to `block-ip.sh list` if it gets too long for a single Discord field)
+
+For the actual list of which IPs are blocked and why, use `sudo block-ip.sh
+list` — the report intentionally only shows the count, not the full list, to
+keep it short and avoid the report growing unwieldy as more IPs accumulate.
 
 You can run it manually any time, regardless of the cron schedule or even if
 reports are disabled entirely for testing:
@@ -199,6 +201,18 @@ every subsequent failed/preauth notification from that IP fires regardless of
 `NOTIFY_FAILED_ATTEMPTS`. This matters most if you run with `AUTO_BLOCK=false`
 (so the IP is never actually blocked) — without this override, a determined
 attacker could keep retrying indefinitely in total silence.
+
+**This override never applies to an IP that's already blocked.** A rapid
+burst of attempts can easily push the attempt count past `FAIL_THRESHOLD`
+before the block finishes taking effect — in-flight connections, or an
+attacker reconnecting faster than the firewall rule propagates — which
+would otherwise cause a string of "6/5", "7/5", etc. failed-attempt
+notifications right after the block, bypassing `NOTIFY_FAILED_ATTEMPTS=false`
+on every single one even though the "IP Blocked" notification already
+covered it. Once `block-ip.sh` has recorded the IP as blocked, any further
+attempts from it go back to following `NOTIFY_FAILED_ATTEMPTS` normally (so
+with it set to `false`, they stay silent) — the escalation override only
+matters for IPs that aren't blocked yet.
 
 ## Managing blocked IPs
 
