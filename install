@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+#
+# install — SSH Discord Notifier + Auto-Block + Reports installer
+#
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/pjortiz/ssh-guard/refs/heads/main/install | sudo bash
+#
+#   Non-interactive:
+#   curl -fsSL https://raw.githubusercontent.com/pjortiz/ssh-guard/refs/heads/main/install | sudo \
+#     WEBHOOK_URL="https://discord.com/api/webhooks/xxx/yyy" \
+#     AUTO_BLOCK=true FAIL_THRESHOLD=5 FAIL_WINDOW=600 \
+#     NOTIFY_FAILED_ATTEMPTS=true NOTIFY_ON_BLOCK=true \
+#     MENTION_DEFAULT=none REPORT_ENABLED=false REPORT_CRON="0 8 * * *" \
+#     bash
+#
+# Installs:
+#   /etc/ssh-guard/config.conf                        (shared settings, webhook URL, mentions)
+#   /usr/local/bin/ssh-guard-notify                   (watches journal, notifies, auto-blocks)
+#   /usr/local/bin/ssh-guard-block-ip                 (manual/automatic IP block/unblock)
+#   /usr/local/bin/ssh-guard-report                   (periodic Discord summary report)
+#   /etc/systemd/system/ssh-discord-notify.service    (systemd unit for the notifier)  
+#   /etc/cron.d/ssh-guard-report                      (cron schedule for the report; self-gates on REPORT_ENABLED)
+#
+set -euo pipefail
+
+# ---------- must be root ----------
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "This installer must be run as root (try: sudo bash install)" >&2
+  exit 1
+fi
+
+# ---------- dependencies ----------
+for bin in curl systemctl journalctl; do
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    echo "Required command '$bin' not found. This installer targets systemd-based Linux distros." >&2
+    exit 1
+  fi
+done
+
+if ! command -v ufw >/dev/null 2>&1 && ! command -v firewall-cmd >/dev/null 2>&1 \
+   && ! command -v nft >/dev/null 2>&1 && ! command -v iptables >/dev/null 2>&1; then
+  echo "No supported firewall tool found (ufw, firewalld, nft, or iptables)." >&2
+  echo "The notifier will still work, but auto-block/ssh-guard-block-ip will not." >&2
+fi
+
+if ! command -v crontab >/dev/null 2>&1 \
+   && ! systemctl list-unit-files 2>/dev/null | grep -qiE '^(cron|crond)\.service'; then
+  echo "No cron daemon detected (cron/crond). Periodic reports will only run if you invoke" >&2
+  echo "/usr/local/bin/ssh-guard-report manually, or install a cron package (e.g. apt install cron)." >&2
+fi
+
+prompt() {
+  # prompt <var_name> <question> <default>
+  local __var="$1" __question="$2" __default="$3" __answer
+  if [[ -n "${!__var:-}" ]]; then
+    return 0   # already set via env var
+  fi
+  if [[ -t 0 ]]; then
+    read -r -p "${__question} [${__default}]: " __answer
+  else
+    echo -n "${__question} [${__default}]: " > /dev/tty
+    read -r __answer < /dev/tty
+  fi
+  printf -v "$__var" '%s' "${__answer:-$__default}"
+}
+
+# ---------- load existing config (if any) as defaults for a clean rerun ----------
+EXISTING_CONFIG="/etc/ssh-guard/config.conf"
+_EXISTING_WEBHOOK_URL="" _EXISTING_SSHD_UNIT="" _EXISTING_DO_GEOIP=""
+_EXISTING_AUTO_BLOCK="" _EXISTING_FAIL_THRESHOLD="" _EXISTING_FAIL_WINDOW=""
+_EXISTING_NOTIFY_FAILED_ATTEMPTS="" _EXISTING_NOTIFY_ON_BLOCK=""
+_EXISTING_MENTION_ON_FAILURE="" _EXISTING_REPORT_ENABLED="" _EXISTING_REPORT_CRON=""
+if [[ -f "$EXISTING_CONFIG" ]]; then
+  echo "==> Existing config found at $EXISTING_CONFIG — its values will be offered as defaults."
+  # shellcheck disable=SC1090
+  source <(grep -E '^[A-Z_]+=' "$EXISTING_CONFIG" | sed 's/^/_EXISTING_/')
+fi
+
+# ---------- detect sshd systemd unit name ----------
+SSHD_UNIT_DETECTED=""
+for candidate in ssh sshd; do
+  if systemctl list-unit-files "${candidate}.service" --no-legend 2>/dev/null | grep -q "${candidate}.service"; then
+    SSHD_UNIT_DETECTED="$candidate"
+    break
+  fi
+done
+SSHD_UNIT="${SSHD_UNIT:-${_EXISTING_SSHD_UNIT:-$SSHD_UNIT_DETECTED}}"
+if [[ -z "$SSHD_UNIT" ]]; then
+  prompt SSHD_UNIT "Could not auto-detect sshd unit. Enter it (e.g. sshd)" "ssh"
+fi
+echo "==> Using SSH service unit: ${SSHD_UNIT}"
+
+# ---------- collect settings (existing config values are offered as defaults) ----------
+if [[ -z "${WEBHOOK_URL:-}" ]]; then
+  prompt WEBHOOK_URL "Enter your Discord webhook URL" "${_EXISTING_WEBHOOK_URL:-}"
+fi
+if [[ -z "$WEBHOOK_URL" || "$WEBHOOK_URL" != https://discord.com/api/webhooks/* ]]; then
+  echo "That doesn't look like a valid Discord webhook URL (expected https://discord.com/api/webhooks/...)." >&2
+  exit 1
+fi
+
+prompt DO_GEOIP        "Include GeoIP lookups in notifications? (true/false)" "${_EXISTING_DO_GEOIP:-true}"
+prompt AUTO_BLOCK      "Auto-block IPs after repeated failed logins? (true/false)" "${_EXISTING_AUTO_BLOCK:-true}"
+prompt FAIL_THRESHOLD  "Failed attempts before auto-block" "${_EXISTING_FAIL_THRESHOLD:-5}"
+prompt FAIL_WINDOW     "Time window for the above, in seconds" "${_EXISTING_FAIL_WINDOW:-600}"
+prompt NOTIFY_FAILED_ATTEMPTS "Send a Discord message for EVERY failed/preauth attempt? (false = stay quiet until an IP is actually blocked; repeat offenders past the threshold above always notify regardless, unless the IP is already blocked)" "${_EXISTING_NOTIFY_FAILED_ATTEMPTS:-true}"
+prompt NOTIFY_ON_BLOCK "Send a Discord message when an IP gets blocked? (false = block silently)" "${_EXISTING_NOTIFY_ON_BLOCK:-true}"
+prompt MENTION_DEFAULT "Default @mention for ALL notification types — none / everyone / role:<id> / user:<id> (you can fine-tune each type individually afterward by editing config.conf; this will overwrite any such per-type customization)" "${_EXISTING_MENTION_ON_FAILURE:-none}"
+prompt REPORT_ENABLED  "Enable periodic summary reports (failed/invalid/blocked counts) via cron? (true/false)" "${_EXISTING_REPORT_ENABLED:-false}"
+prompt REPORT_CRON     "Cron schedule for the report (standard 5-field cron syntax)" "${_EXISTING_REPORT_CRON:-0 8 * * *}"
+
+
+# ---------- write shared config ----------
+echo "==> Writing /etc/ssh-guard/config.conf"
+mkdir -p /etc/ssh-guard
+cat > /etc/ssh-guard/config.conf <<EOF
+# ssh-guard shared config — used by ssh-guard-notify, ssh-guard-block-ip, and ssh-guard-report
+WEBHOOK_URL="${WEBHOOK_URL}"
+SSHD_UNIT="${SSHD_UNIT}"
+DO_GEOIP="${DO_GEOIP}"
+AUTO_BLOCK="${AUTO_BLOCK}"
+FAIL_THRESHOLD=${FAIL_THRESHOLD}
+FAIL_WINDOW=${FAIL_WINDOW}
+NOTIFY_FAILED_ATTEMPTS="${NOTIFY_FAILED_ATTEMPTS}"
+
+# Notification toggles
+NOTIFY_ON_BLOCK="${NOTIFY_ON_BLOCK}"
+NOTIFY_ON_UNBLOCK="true"
+
+# @mentions per notification type: none / everyone / role:<id> / user:<id>
+MENTION_ON_FAILURE="${MENTION_DEFAULT}"
+MENTION_ON_SUCCESS="${MENTION_DEFAULT}"
+MENTION_ON_BLOCK="${MENTION_DEFAULT}"
+MENTION_ON_UNBLOCK="${MENTION_DEFAULT}"
+MENTION_ON_REPORT="${MENTION_DEFAULT}"
+
+# Periodic summary report (see /etc/cron.d/ssh-guard-report)
+REPORT_ENABLED="${REPORT_ENABLED}"
+REPORT_CRON="${REPORT_CRON}"
+EOF
+chmod 600 /etc/ssh-guard/config.conf
+chown root:root /etc/ssh-guard/config.conf
+
+# ---------- install ssh-guard ----------
+echo "==> Installing ssh-guard"
+cp ./usr/local/bin/* /usr/local/bin/
+chmod 700 /usr/local/bin/ssh-guard-notify /usr/local/bin/ssh-guard-block-ip /usr/local/bin/ssh-guard-report
+chown root:root /usr/local/bin/ssh-guard-notify /usr/local/bin/ssh-guard-block-ip /usr/local/bin/ssh-guard-report
+
+
+# ---------- cron schedule for the report ----------
+echo "==> Installing /etc/cron.d/ssh-guard-report"
+cat > /etc/cron.d/ssh-guard-report <<CRON_EOF
+# ssh-guard periodic report. Schedule below is set from REPORT_CRON at install
+# time; the script itself checks REPORT_ENABLED in config.conf and no-ops if
+# disabled, so it's safe to leave this file in place either way.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+${REPORT_CRON} root /usr/local/bin/ssh-guard-report >/dev/null 2>&1
+CRON_EOF
+chmod 644 /etc/cron.d/ssh-guard-report
+
+# ---------- systemd unit ----------
+echo "==> Installing /etc/systemd/system/ssh-discord-notify.service"
+cat > /etc/systemd/system/ssh-discord-notify.service <<UNIT_EOF
+[Unit]
+Description=SSH login attempt notifier + auto-block (Discord)
+After=network-online.target ${SSHD_UNIT}.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=-/usr/local/bin/ssh-guard-block-ip sync
+ExecStart=/usr/local/bin/ssh-guard-notify
+Restart=always
+RestartSec=5
+User=root
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+
+echo "==> Reloading systemd and starting the service"
+systemctl daemon-reload
+
+if systemctl is-enabled --quiet ssh-discord-notify.service; then
+  echo "==> Service already enabled. Restarting..."
+  systemctl restart ssh-discord-notify.service
+else
+  echo "==> Enabling and starting the service..."
+  systemctl enable --now ssh-discord-notify.service
+fi
+
+sleep 1
+if systemctl is-active --quiet ssh-discord-notify.service; then
+  echo "==> ssh-discord-notify is running."
+else
+  echo "==> Service failed to start. Check: journalctl -u ssh-discord-notify -n 50" >&2
+  exit 1
+fi
+# Note: ssh-guard-block-ip sync already ran automatically as part of the service
+# starting (see ExecStartPre in the unit file), reconciling any previously
+# recorded blocks with the live firewall.
+
+echo "==> Sending a test message to Discord..."
+curl -s -H "Content-Type: application/json" -X POST "$WEBHOOK_URL" -d '{
+  "embeds": [{
+    "title": "🔧 SSH Guard Installed",
+    "color": 3447003,
+    "description": "This host will now report SSH login attempts, auto-block IPs after repeated failures, and (if enabled) send periodic summary reports.",
+    "timestamp": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"
+  }]
+}' >/dev/null || echo "Warning: test message failed to send. Double-check the webhook URL." >&2
+
+cat <<DONE
+
+Installed successfully.
+
+  Config:      sudo nano /etc/ssh-guard/config.conf   (then: sudo systemctl restart ssh-discord-notify)
+  Logs:        sudo journalctl -u ssh-discord-notify -f
+  Restart:     sudo systemctl restart ssh-discord-notify
+  Blocked IPs: sudo ssh-guard-block-ip list
+  Live rules:  sudo ssh-guard-block-ip rules
+  Settings:    sudo ssh-guard-block-ip config
+  Manual block:   sudo ssh-guard-block-ip add <ip> "reason"
+  Manual unblock: sudo ssh-guard-block-ip remove <ip>
+  Run a report now: sudo ssh-guard-report   (no-ops unless REPORT_ENABLED=true)
+
+  Uninstall:
+    sudo systemctl disable --now ssh-discord-notify
+    sudo rm -f /usr/local/bin/ssh-guard-notify /usr/local/bin/ssh-guard-block-ip \\
+      /usr/local/bin/ssh-guard-report /etc/systemd/system/ssh-discord-notify.service \\
+      /etc/cron.d/ssh-guard-report
+    sudo rm -rf /etc/ssh-guard /var/lib/ssh-guard
+    sudo systemctl daemon-reload
+
+DONE

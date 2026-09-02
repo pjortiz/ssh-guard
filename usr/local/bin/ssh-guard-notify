@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+#
+# ssh-guard-notify
+# Tails the SSH journal, posts Discord embeds on login success/failure,
+# and — if enabled — auto-blocks an IP after too many failures in a
+# time window by calling ssh-guard-block-ip. Also feeds persistent counters
+# used by ssh-guard-report.sh for periodic summaries.
+#
+set -euo pipefail
+
+CONFIG_FILE="/etc/ssh-guard/config.conf"
+STATE_DIR="/var/lib/ssh-guard"
+FAIL_LOG="${STATE_DIR}/fail_attempts.log"
+LIFETIME_FILE="${STATE_DIR}/lifetime_fail_counts.tsv"
+RECORD_FILE="/etc/ssh-guard/blocked_ips.list"
+BLOCK_SCRIPT="/usr/local/bin/ssh-guard-block-ip"
+
+COUNTER_FAILED_PW="${STATE_DIR}/counter_failed_password.count"
+COUNTER_INVALID_USER="${STATE_DIR}/counter_invalid_user.count"
+COUNTER_PREAUTH="${STATE_DIR}/counter_preauth_closed.count"
+COUNTER_PROBE="${STATE_DIR}/counter_probe.count"
+
+if [[ -f "$CONFIG_FILE" ]]; then
+  source "$CONFIG_FILE"
+else
+  echo "Config file $CONFIG_FILE not found." >&2
+  exit 1
+fi
+
+: "${WEBHOOK_URL:?WEBHOOK_URL not set in $CONFIG_FILE}"
+: "${SSHD_UNIT:=ssh}"
+: "${DO_GEOIP:=true}"
+: "${AUTO_BLOCK:=true}"
+: "${FAIL_THRESHOLD:=5}"
+: "${FAIL_WINDOW:=600}"
+: "${NOTIFY_FAILED_ATTEMPTS:=true}"
+: "${MENTION_ON_FAILURE:=none}"
+: "${MENTION_ON_SUCCESS:=none}"
+
+HOST_LABEL="$(hostname)"
+mkdir -p "$STATE_DIR"
+touch "$FAIL_LOG" "$LIFETIME_FILE" \
+  "$COUNTER_FAILED_PW" "$COUNTER_INVALID_USER" "$COUNTER_PREAUTH" "$COUNTER_PROBE"
+
+# ---------- helpers ----------
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/}"
+  printf '%s' "$s"
+}
+
+geoip_lookup() {
+  local ip="$1"
+  if [[ "$DO_GEOIP" == "true" ]]; then
+    curl -s --max-time 3 "http://ip-api.com/json/${ip}?fields=country,regionName,city" \
+      | grep -oP '(?<="city":")[^"]*|(?<="regionName":")[^"]*|(?<="country":")[^"]*' \
+      | paste -sd, -
+  fi
+}
+
+# Translates a mention spec (none / everyone / role:<id> / user:<id>) into
+# the Discord "content" mention string + the matching allowed_mentions JSON.
+compute_mention() {
+  local spec="$1"
+  MENTION_CONTENT=""
+  MENTION_ALLOWED_JSON='{"parse": []}'
+  case "$spec" in
+    ""|none|NONE) ;;
+    everyone|EVERYONE)
+      MENTION_CONTENT="@everyone"
+      MENTION_ALLOWED_JSON='{"parse": ["everyone"]}'
+      ;;
+    role:*)
+      local rid="${spec#role:}"
+      MENTION_CONTENT="<@&${rid}>"
+      MENTION_ALLOWED_JSON="{\"parse\": [], \"roles\": [\"${rid}\"]}"
+      ;;
+    user:*)
+      local uid="${spec#user:}"
+      MENTION_CONTENT="<@${uid}>"
+      MENTION_ALLOWED_JSON="{\"parse\": [], \"users\": [\"${uid}\"]}"
+      ;;
+  esac
+}
+
+increment_counter() {
+  local file="$1"
+  local val
+  val="$(cat "$file" 2>/dev/null)"
+  [[ -z "$val" ]] && val=0
+  val=$(( val + 1 ))
+  echo "$val" > "$file"
+}
+
+send_discord() {
+  local title="$1" color="$2" user="$3" ip="$4" extra="${5:-}" mention_spec="${6:-none}"
+  local loc
+  loc="$(geoip_lookup "$ip" || true)"
+  [[ -z "$loc" ]] && loc="unknown"
+
+  local fields
+  fields=$(cat <<EOF
+      {"name": "Host", "value": "$(json_escape "$HOST_LABEL")", "inline": true},
+      {"name": "User", "value": "$(json_escape "$user")", "inline": true},
+      {"name": "Source IP", "value": "$(json_escape "$ip")", "inline": true},
+      {"name": "Location", "value": "$(json_escape "$loc")", "inline": false}
+EOF
+)
+  if [[ -n "$extra" ]]; then
+    fields="${fields},
+      {\"name\": \"Detail\", \"value\": \"$(json_escape "$extra")\", \"inline\": false}"
+  fi
+
+  compute_mention "$mention_spec"
+
+  curl -s -H "Content-Type: application/json" -X POST "$WEBHOOK_URL" -d @- >/dev/null <<EOF
+{
+  "content": "${MENTION_CONTENT}",
+  "allowed_mentions": ${MENTION_ALLOWED_JSON},
+  "embeds": [{
+    "title": "$title",
+    "color": $color,
+    "fields": [
+$fields
+    ],
+    "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  }]
+}
+EOF
+}
+
+# Records a failure for $ip, prunes entries older than FAIL_WINDOW,
+# and returns the current count of failures within the window.
+record_failure_and_count() {
+  local ip="$1"
+  local now
+  now="$(date +%s)"
+  echo "${ip}|${now}" >> "$FAIL_LOG"
+
+  local cutoff=$(( now - FAIL_WINDOW ))
+  local tmp
+  tmp="$(mktemp)"
+  awk -F'|' -v cutoff="$cutoff" '$2 >= cutoff' "$FAIL_LOG" > "$tmp" && mv "$tmp" "$FAIL_LOG"
+
+  grep -c "^${ip}|" "$FAIL_LOG" || true
+}
+
+# Increments (or creates) the all-time failure count for $ip in
+# LIFETIME_FILE (tab-separated "ip<TAB>count", never pruned) and
+# echoes the new total.
+increment_lifetime_count() {
+  local ip="$1"
+  local tmp
+  tmp="$(mktemp)"
+  awk -F'\t' -v ip="$ip" -v OFS='\t' '
+    $1 == ip { $2 = $2 + 1; found=1 }
+    { print }
+    END { if (!found) print ip, 1 }
+  ' "$LIFETIME_FILE" > "$tmp"
+  mv "$tmp" "$LIFETIME_FILE"
+  awk -F'\t' -v ip="$ip" '$1 == ip { print $2 }' "$LIFETIME_FILE"
+}
+
+# Reads (without incrementing) the current lifetime failure count for an IP.
+get_lifetime_count() {
+  local ip="$1"
+  local n
+  n="$(awk -F'\t' -v ip="$ip" '$1 == ip { print $2 }' "$LIFETIME_FILE" 2>/dev/null)"
+  echo "${n:-0}"
+}
+
+# Checks whether an IP is already recorded as blocked.
+is_ip_blocked() {
+  local ip="$1"
+  [[ -f "$RECORD_FILE" ]] && grep -q "^${ip}|" "$RECORD_FILE" 2>/dev/null
+}
+
+# Decides whether a failed-attempt notification should be sent: yes if
+# NOTIFY_FAILED_ATTEMPTS is true, OR if this IP is a repeat offender whose
+# lifetime failure count already exceeds FAIL_THRESHOLD — so persistent
+# attackers still get surfaced even when per-attempt notifications are
+# otherwise muted. That escalation is skipped entirely, though, once the
+# IP is already blocked: a burst of near-simultaneous attempts can land
+# after the block fires (in-flight connections, or an IP reconnecting
+# faster than the firewall rule takes effect) and would otherwise bypass
+# NOTIFY_FAILED_ATTEMPTS=false on every single one of them, even though
+# the "IP Blocked" notification already covered it.
+should_notify_failure() {
+  local lifetime="$1" ip="$2"
+  if [[ "$NOTIFY_FAILED_ATTEMPTS" == "true" ]]; then
+    return 0
+  fi
+  if is_ip_blocked "$ip"; then
+    return 1
+  fi
+  if (( lifetime > FAIL_THRESHOLD )); then
+    return 0
+  fi
+  return 1
+}
+
+maybe_auto_block() {
+  local ip="$1" count="$2"
+
+  [[ "$AUTO_BLOCK" != "true" ]] && return 0
+  (( count < FAIL_THRESHOLD )) && return 0
+
+  if [[ ! -x "$BLOCK_SCRIPT" ]]; then
+    echo "AUTO_BLOCK is enabled but $BLOCK_SCRIPT is missing or not executable." >&2
+    return 0
+  fi
+
+  # ssh-guard-block-ip add is idempotent, and it sends its own Discord
+  # notification (via the shared config) when it actually blocks.
+  "$BLOCK_SCRIPT" add "$ip" "auto-blocked: ${count} failed SSH attempts in ${FAIL_WINDOW}s" || true
+}
+
+echo "ssh-discord-notify: watching unit '$SSHD_UNIT'..."
+
+journalctl -fu "$SSHD_UNIT" -o cat --since "now" | while IFS= read -r line; do
+  if [[ "$line" =~ Accepted\ (password|publickey|keyboard-interactive)\ for\ ([^[:space:]]+)\ from\ ([^[:space:]]+)\ port ]]; then
+    user="${BASH_REMATCH[2]}"
+    ip="${BASH_REMATCH[3]}"
+    # Deliberately uses a warning icon/color, not a green checkmark — a
+    # successful login is exactly the event you want to notice immediately,
+    # since it could be you... or it could be an intrusion.
+    send_discord "⚠️ SSH Login Succeeded" 16753920 "$user" "$ip" "" "$MENTION_ON_SUCCESS"
+
+  elif [[ "$line" =~ Failed\ password\ for\ (invalid\ user\ )?([^[:space:]]+)\ from\ ([^[:space:]]+)\ port ]]; then
+    user="${BASH_REMATCH[2]}"
+    ip="${BASH_REMATCH[3]}"
+    count="$(record_failure_and_count "$ip")"
+    lifetime="$(increment_lifetime_count "$ip")"
+    increment_counter "$COUNTER_FAILED_PW"
+    if should_notify_failure "$lifetime" "$ip"; then
+      send_discord "❌ SSH Login Failed" 15158332 "$user" "$ip" "Attempt ${count}/${FAIL_THRESHOLD} in ${FAIL_WINDOW}s window • Lifetime failed attempts from this IP: ${lifetime}" "$MENTION_ON_FAILURE"
+    fi
+    maybe_auto_block "$ip" "$count"
+
+  elif [[ "$line" =~ Invalid\ user\ ([^[:space:]]*)\ from\ ([^[:space:]]+)\ port ]]; then
+    raw_user="${BASH_REMATCH[1]}"
+    user="${raw_user:-<blank>}"
+    ip="${BASH_REMATCH[2]}"
+    count="$(record_failure_and_count "$ip")"
+    lifetime="$(increment_lifetime_count "$ip")"
+    increment_counter "$COUNTER_INVALID_USER"
+    if should_notify_failure "$lifetime" "$ip"; then
+      send_discord "❌ SSH Login Failed" 15158332 "$user" "$ip" "Invalid username, rejected before password prompt • Attempt ${count}/${FAIL_THRESHOLD} in ${FAIL_WINDOW}s window • Lifetime failed attempts from this IP: ${lifetime}" "$MENTION_ON_FAILURE"
+    fi
+    maybe_auto_block "$ip" "$count"
+
+  elif [[ "$line" =~ (Connection\ closed\ by|Disconnected\ from)\ authenticating\ user\ ([^[:space:]]+)\ ([^[:space:]]+)\ port.*\[preauth\] ]]; then
+    user="${BASH_REMATCH[2]}"
+    ip="${BASH_REMATCH[3]}"
+    lifetime="$(get_lifetime_count "$ip")"
+    increment_counter "$COUNTER_PREAUTH"
+    if should_notify_failure "$lifetime" "$ip"; then
+      send_discord "⚠️ SSH Connection Closed (preauth)" 15105570 "$user" "$ip" "" "$MENTION_ON_FAILURE"
+    fi
+
+  elif [[ "$line" =~ ^Connection\ closed\ by\ ([^[:space:]]+)\ port\ [0-9]+\ \[preauth\]$ ]]; then
+    # Bare "Connection closed by <ip> port <port> [preauth]" with no
+    # username at all — a plain port scan / banner grab, no auth
+    # attempted. Counted for the periodic report, but never notified
+    # individually — every scanner on the internet triggers this.
+    increment_counter "$COUNTER_PROBE"
+  fi
+done

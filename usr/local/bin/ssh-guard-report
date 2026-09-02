@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+#
+# ssh-guard-report
+# Sends a periodic Discord summary: failed/invalid/preauth/probe counts
+# since the last report, how many IPs were newly blocked, and the full
+# list of currently blocked IPs with reasons. Meant to be run on a cron
+# schedule (see REPORT_CRON in /etc/ssh-guard/config.conf), but can also
+# be run manually at any time.
+#
+# Does nothing (exits 0 silently) unless REPORT_ENABLED=true in config,
+# so it's safe to leave the cron job installed even when reports are
+# turned off.
+#
+set -euo pipefail
+
+CONFIG_FILE="/etc/ssh-guard/config.conf"
+STATE_DIR="/var/lib/ssh-guard"
+RECORD_FILE="/etc/ssh-guard/blocked_ips.list"
+BASELINE_FILE="${STATE_DIR}/report_baseline.tsv"
+
+COUNTER_FAILED_PW="${STATE_DIR}/counter_failed_password.count"
+COUNTER_INVALID_USER="${STATE_DIR}/counter_invalid_user.count"
+COUNTER_PREAUTH="${STATE_DIR}/counter_preauth_closed.count"
+COUNTER_PROBE="${STATE_DIR}/counter_probe.count"
+COUNTER_BLOCKS_TOTAL="${STATE_DIR}/counter_blocks_total.count"
+
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck source=/etc/ssh-guard/config.conf
+  source "$CONFIG_FILE"
+else
+  echo "Config file $CONFIG_FILE not found." >&2
+  exit 1
+fi
+
+: "${WEBHOOK_URL:?WEBHOOK_URL not set in $CONFIG_FILE}"
+: "${REPORT_ENABLED:=false}"
+: "${MENTION_ON_REPORT:=none}"
+
+if [[ "$REPORT_ENABLED" != "true" ]]; then
+  exit 0
+fi
+
+mkdir -p "$STATE_DIR"
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/}"
+  printf '%s' "$s"
+}
+
+compute_mention() {
+  local spec="$1"
+  MENTION_CONTENT=""
+  MENTION_ALLOWED_JSON='{"parse": []}'
+  case "$spec" in
+    ""|none|NONE) ;;
+    everyone|EVERYONE)
+      MENTION_CONTENT="@everyone"
+      MENTION_ALLOWED_JSON='{"parse": ["everyone"]}'
+      ;;
+    role:*)
+      local rid="${spec#role:}"
+      MENTION_CONTENT="<@&${rid}>"
+      MENTION_ALLOWED_JSON="{\"parse\": [], \"roles\": [\"${rid}\"]}"
+      ;;
+    user:*)
+      local uid="${spec#user:}"
+      MENTION_CONTENT="<@${uid}>"
+      MENTION_ALLOWED_JSON="{\"parse\": [], \"users\": [\"${uid}\"]}"
+      ;;
+  esac
+}
+
+read_counter() {
+  local file="$1"
+  local val
+  val="$(cat "$file" 2>/dev/null)"
+  [[ -z "$val" ]] && val=0
+  echo "$val"
+}
+
+cur_failed_pw="$(read_counter "$COUNTER_FAILED_PW")"
+cur_invalid_user="$(read_counter "$COUNTER_INVALID_USER")"
+cur_preauth="$(read_counter "$COUNTER_PREAUTH")"
+cur_probe="$(read_counter "$COUNTER_PROBE")"
+cur_blocks_total="$(read_counter "$COUNTER_BLOCKS_TOTAL")"
+
+base_failed_pw=0
+base_invalid_user=0
+base_preauth=0
+base_probe=0
+base_blocks_total=0
+base_time=""
+if [[ -f "$BASELINE_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$BASELINE_FILE"
+fi
+
+delta_failed_pw=$(( cur_failed_pw - base_failed_pw ))
+delta_invalid_user=$(( cur_invalid_user - base_invalid_user ))
+delta_preauth=$(( cur_preauth - base_preauth ))
+delta_probe=$(( cur_probe - base_probe ))
+delta_blocks=$(( cur_blocks_total - base_blocks_total ))
+
+period_desc="since monitoring began"
+if [[ -n "$base_time" ]]; then
+  period_desc="since ${base_time}"
+fi
+
+# Currently-blocked IP count (point-in-time, not a delta) — the full list
+# used to be included here too, but that's dropped now: it duplicates what
+# `ssh-guard-block-ip list` already shows on demand, and grows unwieldy fast.
+total_blocked=0
+if [[ -s "$RECORD_FILE" ]]; then
+  total_blocked="$(wc -l < "$RECORD_FILE" | tr -d '[:space:]')"
+fi
+
+compute_mention "$MENTION_ON_REPORT"
+
+now_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+host_label="$(hostname)"
+
+curl -s -H "Content-Type: application/json" -X POST "$WEBHOOK_URL" -d @- >/dev/null <<PAYLOAD
+{
+  "content": "${MENTION_CONTENT}",
+  "allowed_mentions": ${MENTION_ALLOWED_JSON},
+  "embeds": [{
+    "title": "📊 SSH Guard Report",
+    "color": 3447003,
+    "description": "$(json_escape "Summary ${period_desc} for ${host_label}")",
+    "fields": [
+      {"name": "Failed password attempts", "value": "${delta_failed_pw}", "inline": true},
+      {"name": "Invalid user attempts", "value": "${delta_invalid_user}", "inline": true},
+      {"name": "Preauth disconnects", "value": "${delta_preauth}", "inline": true},
+      {"name": "Unauthenticated probes", "value": "${delta_probe}", "inline": true},
+      {"name": "New IPs blocked", "value": "${delta_blocks}", "inline": true},
+      {"name": "Total IPs currently blocked", "value": "${total_blocked}", "inline": true}
+    ],
+    "timestamp": "${now_ts}"
+  }]
+}
+PAYLOAD
+
+# Update the baseline so the next report reports the *next* period, not
+# a growing all-time total.
+cat > "$BASELINE_FILE" <<EOF
+base_failed_pw=${cur_failed_pw}
+base_invalid_user=${cur_invalid_user}
+base_preauth=${cur_preauth}
+base_probe=${cur_probe}
+base_blocks_total=${cur_blocks_total}
+base_time="${now_ts}"
+EOF
